@@ -379,6 +379,23 @@ def aggregate_traces(rows: List[Dict], headers: List[str]) -> List[Dict]:
             
     return processed_rows
 
+import math
+
+def clean_for_json(obj):
+    """
+    Recursively clean dictionary/list to replace NaN/Infinity with None or string,
+    ensuring JSON compatibility for standard JSON parsers (like in browsers).
+    """
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    elif isinstance(obj, dict):
+        return {k: clean_for_json(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [clean_for_json(v) for v in obj]
+    return obj
+
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
     if not file.filename.endswith('.xlsx'):
@@ -453,14 +470,18 @@ async def upload_file(file: UploadFile = File(...)):
         
         # Process D240 faults (sort and merge)
         rows = process_d240_faults(rows, headers)
-                
-        return {
+        
+        result = {
             "sheet_name": target_sheet_name,
             "headers": headers,
             "rows": rows
         }
+        
+        return clean_for_json(result)
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
