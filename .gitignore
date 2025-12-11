@@ -17,3 +17,7 @@ dist/
 build/
 .DS_Store
 coverage/
+
+# Excel temporary files
+~$*.xlsx
+~$*.xls

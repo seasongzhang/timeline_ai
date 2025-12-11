@@ -25,8 +25,8 @@ function App() {
     formData.append('file', file);
 
     try {
-      // In development, we need to point to the backend port
-      const response = await axios.post('http://localhost:8000/api/upload', formData, {
+      // Use relative path for API calls, which works for both dev (with proxy) and prod
+      const response = await axios.post('/api/upload', formData, {
         headers: {
           'Content-Type': 'multipart/form-data',
         },
