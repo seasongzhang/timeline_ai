@@ -1,0 +1,61 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Override Ant Design Timeline for compact left layout using custom class */
+
+/* Target the label (timestamp) */
+.custom-timeline .ant-timeline-item-label {
+  width: 130px !important; /* Slightly reduced width */
+  text-align: right !important; /* Right align to be closer to the line */
+  flex: none !important; /* Disable flex scaling */
+  padding-right: 12px !important; /* Gap between text and line */
+}
+
+/* Also target potentially internal elements if Ant Design structure varies */
+.custom-timeline .ant-timeline-item-header {
+  flex: none !important;
+  width: 130px !important;
+}
+
+/* Position the axis (line and dot) right after the label */
+/* Include all potential classes for the line/rail */
+.custom-timeline .ant-timeline-item-tail,
+.custom-timeline .ant-timeline-item-head,
+.custom-timeline .ant-timeline-item-rail {
+  left: 130px !important; /* Aligned with label width */
+}
+
+/* Position the content to take up the rest of the width */
+.custom-timeline .ant-timeline-item-content {
+  left: 130px !important; /* Aligned with label width */
+  width: calc(100% - 130px) !important;
+  margin-left: 0 !important;
+  padding-left: 24px !important; /* Gap between line and content */
+  top: -8px !important; /* Adjust vertical alignment if needed */
+  flex: auto !important; /* Ensure content takes remaining space */
+}
+
+/* Adjust for small screens if needed */
+@media (max-width: 640px) {
+  .custom-timeline .ant-timeline-item-label {
+    width: 90px !important;
+    font-size: 11px;
+    padding-right: 8px !important;
+  }
+  .custom-timeline .ant-timeline-item-tail,
+  .custom-timeline .ant-timeline-item-head,
+  .custom-timeline .ant-timeline-item-rail {
+    left: 90px !important;
+  }
+  .custom-timeline .ant-timeline-item-content {
+    left: 90px !important;
+    width: calc(100% - 90px) !important;
+  }
+}
+
+/* Hide the vertical line as requested */
+.custom-timeline .ant-timeline-item-tail,
+.custom-timeline .ant-timeline-item-rail {
+  display: none !important;
+}
