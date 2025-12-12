@@ -4,7 +4,7 @@ import axios from 'axios'; // HTTP 客户端：用于向后端发送请求
 import { Upload, Button, Timeline, Card, Tag, Typography, Input, message, Drawer, Space, Tooltip, Select, Row, Col, Slider } from 'antd';
 // Ant Design 图标库：提供界面所需的各种图标
 import { UploadOutlined, SearchOutlined, FilterOutlined, InfoCircleOutlined, WifiOutlined, ApartmentOutlined, HistoryOutlined } from '@ant-design/icons';
-import { Analytics } from "@vercel/analytics/next"
+import { Analytics } from "@vercel/analytics/react"
 import './index.css'; // 全局样式文件
 
 // 从 Typography 组件中提取子组件，方便直接使用
