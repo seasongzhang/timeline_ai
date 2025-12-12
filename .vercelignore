@@ -1,0 +1,11 @@
+data/
+backend/
+app.py
+analyze_excel.py
+verify_aggregation.py
+requirements-dev.txt
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
