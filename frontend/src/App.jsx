@@ -1,11 +1,20 @@
 import { useState, useMemo, useEffect } from 'react'; // React 核心 Hooks：状态管理、计算缓存、副作用处理
 import axios from 'axios'; // HTTP 客户端：用于向后端发送请求
 // Ant Design UI 组件库：提供现成的界面元素
-import { Upload, Button, Timeline, Card, Tag, Typography, Input, message, Drawer, Space, Tooltip, Select, Row, Col, Slider, Modal, Spin, Table } from 'antd';
+import { Upload, Button, Timeline, Card, Tag, Typography, Input, message, Drawer, Space, Tooltip, Select, Row, Col, Slider, Modal, Spin, Table, Popover, Checkbox } from 'antd';
 // Ant Design 图标库：提供界面所需的各种图标
-import { UploadOutlined, SearchOutlined, FilterOutlined, InfoCircleOutlined, WifiOutlined, ApartmentOutlined, HistoryOutlined, RobotOutlined, BugOutlined } from '@ant-design/icons';
+import { UploadOutlined, SearchOutlined, FilterOutlined, InfoCircleOutlined, WifiOutlined, ApartmentOutlined, HistoryOutlined, RobotOutlined, BugOutlined, SettingOutlined } from '@ant-design/icons';
 import ReactMarkdown from 'react-markdown';
 import './index.css'; // 全局样式文件
+
+// ==================== 全局属性配置 ====================
+// 定义所有可用的全局属性列及其默认显示状态
+const GLOBAL_ATTR_DEFS = [
+  { key: '合同号', label: '合同号梯号', width: '120px', defaultVisible: false },
+  { key: '控制同步层', label: '控制同步层(从0开始)', width: '60px', defaultVisible: true },
+  { key: '41DG信号', label: '41DG轿门&层门', width: '60px', defaultVisible: false },
+  { key: '延时时长', label: '延时上传(分钟)', width: '80px', defaultVisible: false }
+];
 
 // 从 Typography 组件中提取子组件，方便直接使用
 const { Title, Text, Paragraph } = Typography;
@@ -32,6 +41,15 @@ function App() {
   const [timeRange, setTimeRange] = useState([0, 0]);
   // 完整时间范围：数据的最小和最大时间戳，用于滑块的边界
   const [fullTimeRange, setFullTimeRange] = useState([0, 0]);
+
+  // ==================== 视图控制状态 ====================
+  // 控制是否隐藏非关键信息行
+  const [hideNonCritical, setHideNonCritical] = useState(false);
+  
+  // 控制全局属性列的显示/隐藏
+  const [visibleAttrKeys, setVisibleAttrKeys] = useState(
+      GLOBAL_ATTR_DEFS.filter(c => c.defaultVisible).map(c => c.key)
+  );
 
   // ==================== AI 分析状态 ====================
   const [analysisLoading, setAnalysisLoading] = useState(false);
@@ -230,9 +248,17 @@ function App() {
           }
       }
 
+      // 4. 隐藏非关键信息筛选
+      if (hideNonCritical) {
+          // 检查 row.tags 是否包含非关键标签
+          if (row.tags && row.tags.includes("【ℹ️非关键】")) {
+              return false;
+          }
+      }
+
       return true;
     });
-  }, [data, searchText, selectedDevice, columns, timeRange, fullTimeRange]);
+  }, [data, searchText, selectedDevice, columns, timeRange, fullTimeRange, hideNonCritical]);
 
   /**
    * 心跳与事件数据分离
@@ -337,7 +363,9 @@ function App() {
 
     return {
       key: row.id,
-      // color: rowBg !== '#ffffff' ? rowBg : 'blue', // 时间轴圆点颜色
+      // Remove default dot
+      dot: <></>,
+      color: rowBg !== '#ffffff' ? rowBg : 'blue', // 时间轴圆点颜色
       // 时间显示：对应 HTML 中的 <strong> 标签
       // Warning: items.label deprecated -> items.title?
       // Warning: items.children deprecated -> items.content?
@@ -352,18 +380,19 @@ function App() {
         // Flex layout for Global Attributes columns + Main Content
         <div className="flex flex-row gap-2 items-stretch">
            {/* Global Attribute Columns */}
-           {/* Defined columns based on backend GLOBAL_ATTR_CONFIG */}
-           {/* If we want to make this dynamic, we need to fetch config. For now hardcoded as per requirement. */}
-           {[
-             { key: '控制同步层', label: '同步层', width: '30px' },
-             { key: '41DG信号', label: '41DG', width: '40px' } 
-           ].map(col => {
-             const val = row.global_attributes?.[col.key];
-             return (
-               <div key={col.key} style={{ width: col.width, minWidth: col.width }} className="flex flex-col justify-center">
-                 {val ? (
-                   <Tooltip title={col.key}>
-                     <Card 
+           {/* Render only visible columns based on visibleAttrKeys */}
+           {GLOBAL_ATTR_DEFS
+             .filter(col => visibleAttrKeys.includes(col.key))
+             .map(col => {
+                const val = row.global_attributes?.[col.key];
+                // Check if value exists (including 0, but excluding null/undefined/empty string)
+                const hasValue = val !== undefined && val !== null && val !== '';
+                
+                return (
+                  <div key={col.key} style={{ width: col.width, minWidth: col.width }} className="flex flex-col justify-center">
+                    {hasValue ? (
+                      <Tooltip title={col.key}>
+                        <Card 
                         size="small" 
                         styles={{ body: { padding: '4px', textAlign: 'center', fontSize: '12px', fontWeight: 'bold' } }}
                         className="w-full h-full flex items-center justify-center bg-gray-50 border-gray-200"
@@ -436,6 +465,63 @@ function App() {
   // 生成时间轴数据项列表
   const timelineItems = displayRows.map(row => getTimelineItem(row));
 
+  // ==================== 辅助函数：格式化 Note 显示 ====================
+  const formatDrawerNote = (note) => {
+    if (!note) return null;
+    try {
+        let obj;
+        // Try to parse JSON
+        try {
+            // Replace Python-like None/True/False if simple replace works, else trust backend cleaned it
+            // Backend `_extract_json_from_comment` handles cleaning, but here we might get raw string
+            // Let's try standard JSON.parse first
+            obj = JSON.parse(note);
+        } catch {
+            // If failed, try replacing single quotes to double quotes (simple case)
+            try {
+                const fixed = note.replace(/'/g, '"').replace(/True/g, 'true').replace(/False/g, 'false').replace(/None/g, 'null');
+                obj = JSON.parse(fixed);
+            } catch {
+                // Not JSON
+            }
+        }
+
+        if (obj && typeof obj === 'object') {
+            return (
+                <div className="text-xs text-gray-500 mt-2 bg-gray-50 p-2 rounded border border-gray-100">
+                    {Object.entries(obj).map(([k, v]) => (
+                        <div key={k} className="font-mono">
+                            <span className="text-gray-600">{k}:</span> <span className={v ? 'text-green-600' : 'text-red-600'}>{String(v)}</span>
+                        </div>
+                    ))}
+                </div>
+            );
+        }
+        
+        // If not object, maybe comma separated string like key:val, key:val
+        // Check if it looks like key-value pairs
+        if (note.includes(':') && note.includes(',')) {
+             // Remove braces
+             const clean = note.replace(/^\{|\}$/g, '');
+             const parts = clean.split(',').map(p => p.trim()).filter(Boolean);
+             return (
+                <div className="text-xs text-gray-500 mt-2 bg-gray-50 p-2 rounded border border-gray-100">
+                    {parts.map((part, i) => {
+                        // Remove quotes from key
+                        // "Key": val -> Key: val
+                        const p = part.replace(/^"([^"]+)":/, '$1:').replace(/^'([^']+)':/, '$1:');
+                        return <div key={i} className="font-mono">{p}</div>;
+                    })}
+                </div>
+             );
+        }
+
+        return <div className="text-xs text-gray-500 mt-1">{note}</div>;
+    } catch (e) {
+        return <div className="text-xs text-gray-500 mt-1">{note}</div>;
+    }
+  };
+
   // ==================== 主渲染 (Main Render) ====================
   return (
     <div className="min-h-screen bg-gray-50 p-4">
@@ -496,16 +582,51 @@ function App() {
                     style={{ width: 250 }}
                     allowClear
                  />
+
+                 {/* 隐藏非关键信息开关 */}
+                 <Button 
+                    type={hideNonCritical ? "primary" : "default"}
+                    icon={<FilterOutlined />}
+                    onClick={() => setHideNonCritical(!hideNonCritical)}
+                 >
+                    {hideNonCritical ? "显示所有" : "隐藏非关键"}
+                 </Button>
+
+                 {/* 全局属性列配置 */}
+                 <Popover
+                    trigger="click"
+                    placement="bottom"
+                    content={
+                        <div className="flex flex-col gap-2 p-2 w-48">
+                            <Text strong className="mb-1">显示属性列</Text>
+                            <Checkbox.Group 
+                                className="flex flex-col gap-2"
+                                value={visibleAttrKeys}
+                                onChange={setVisibleAttrKeys}
+                            >
+                                {GLOBAL_ATTR_DEFS.map(attr => (
+                                    <Checkbox key={attr.key} value={attr.key}>
+                                        {attr.label}
+                                    </Checkbox>
+                                ))}
+                            </Checkbox.Group>
+                        </div>
+                    }
+                 >
+                    <Button icon={<SettingOutlined />}>
+                        属性列
+                    </Button>
+                 </Popover>
                  
                  {/* AI 分析按钮 */}
-                 <Button 
+                 {/* <Button 
                     type="default" 
                     icon={<RobotOutlined style={{ color: '#1890ff' }} />} 
                     onClick={handleAnalyze}
                     loading={analysisLoading}
                  >
                     AI 解读
-                 </Button>
+                 </Button> */}
 
                  {/* 调试按钮 */}
                  <Tooltip title="查看规则引擎的打标和提取结果">
@@ -753,10 +874,12 @@ function App() {
                   <div key={colName} className="p-3 bg-gray-50 rounded border border-gray-100">
                      <Text type="secondary" className="block mb-1 text-xs">{colName}</Text>
                      <Text>{selectedRow.cells[colName]?.value}</Text>
+                     {/* Show Comment/Note if exists, formatted */}
+                     {selectedRow.cells[colName]?.comment && formatDrawerNote(selectedRow.cells[colName].comment)}
                   </div>
                ))}
                
-               <div className="mt-4 pt-4 border-t">
+               {/* <div className="mt-4 pt-4 border-t">
                   <Button block icon={<RobotOutlined />} onClick={() => {
                       // Analyze single row
                       setAnalysisLoading(true);
@@ -775,7 +898,7 @@ function App() {
                   }}>
                       AI Analyze This Event
                   </Button>
-               </div>
+               </div> */}
             </div>
           )}
         </Drawer>

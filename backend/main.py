@@ -56,24 +56,31 @@ class TimelinePreprocessor:
             "keywords": [
                 "391(管理综合故障)",
                 "7C8(前门门机警告类综合故障)",
+                "00305025(前门关门轻故障)"
             ],
             "regex": [
                 # r"故障代码.*\(无关\)" # Example regex
             ]
         },
         "delayed_upload": {
-            "threshold_minutes": 10
+            "threshold_minutes": 3
         }
     }
 
     # Configuration for Global Attribute Extraction
     # Format: { AttributeName: [ { keys: [k1, k2], value_map: {val_in_json: normalized_val} } ] }
     GLOBAL_ATTR_CONFIG = {
+        "合同号": [
+             {
+                 "keys": ["产品合同号梯号", "Contract No.", "Device ID"],
+                 "value_map": None
+             }
+        ],
         "控制同步层": [
             {
                 "keys": ["控制同步层"], # Try these keys in order
                 "value_map": None, # Direct value
-                "transform": lambda x: int(x) + 1 if str(x).isdigit() else x # Transform +1 for floor
+                "transform": lambda x: int(x) - 1 if str(x).isdigit() else x # Transform +1 for floor
             }
         ],
         "41DG信号": [
@@ -182,53 +189,152 @@ class TimelinePreprocessor:
     def _extract_attributes(self, row: Dict) -> Dict[str, Any]:
         """
         Extract global attributes from a single row.
+        Priority:
+        1. Extract from Note JSON (comments)
+        2. Extract from Cell Values (columns)
+        3. Special calculations (e.g., Delay Duration)
         """
         extracted = {}
         # Extract Note JSON
         note_str = self._get_comment_from_cells(row)
         note_json = self._extract_json_from_comment(note_str)
         
-        if note_json:
-            for attr_name, rules in self.GLOBAL_ATTR_CONFIG.items():
-                found_val = None
-                
-                for rule in rules:
-                    # Try to find any key from rule['keys'] in note_json
+        for attr_name, rules in self.GLOBAL_ATTR_CONFIG.items():
+            found_val = None
+            
+            for rule in rules:
+                # Strategy 1: Try to find in Note JSON
+                if note_json:
                     for k in rule['keys']:
                         if k in note_json:
-                            raw_val = note_json[k]
-                            
-                            # Apply Value Mapping if exists
-                            if rule.get('value_map'):
-                                # Try exact match first
-                                if raw_val in rule['value_map']:
-                                    found_val = rule['value_map'][raw_val]
-                                # Try string match
-                                elif str(raw_val) in rule['value_map']:
-                                    found_val = rule['value_map'][str(raw_val)]
-                                else:
-                                    # Fallback: keep raw if not mapped? Or None?
-                                    # User wants specific mapping. If not mapped, maybe keep raw.
-                                    found_val = raw_val
-                            else:
-                                found_val = raw_val
-                                
-                            # Apply Transformation if exists
-                            if rule.get('transform') and found_val is not None:
-                                try:
-                                    found_val = rule['transform'](found_val)
-                                except:
-                                    pass
-                            
-                            if found_val is not None:
-                                break # Found a valid key for this rule
-                    
-                    if found_val is not None:
-                        break # Found value for this attribute
+                            found_val = note_json[k]
+                            break
+                
+                # Strategy 2: If not found, try to find in Cell Values (Column Names)
+                if found_val is None:
+                    for k in rule['keys']:
+                        # Check if any column name contains this key
+                        val_from_col = self._get_value_from_cells(row, k)
+                        if val_from_col:
+                            found_val = val_from_col
+                            break
                 
                 if found_val is not None:
-                    extracted[attr_name] = found_val
+                    # Apply Value Mapping if exists
+                    if rule.get('value_map'):
+                        if found_val in rule['value_map']:
+                            found_val = rule['value_map'][found_val]
+                        elif str(found_val) in rule['value_map']:
+                            found_val = rule['value_map'][str(found_val)]
+                        else:
+                            # If map exists but value not found, keep raw? 
+                            # Or strictly map? 
+                            # Assuming keep raw unless explicit strict mode.
+                            pass
+                            
+                    # Apply Transformation if exists
+                    if rule.get('transform'):
+                        try:
+                            found_val = rule['transform'](found_val)
+                        except:
+                            pass
+                    
+                    break # Found value for this rule
+            
+            if found_val is not None:
+                extracted[attr_name] = found_val
+        
+        # Strategy 3: Special Calculation - Delay Duration
+        # Calculate delay regardless of threshold for attribute display
+        content_val = self._get_value_from_cells(row, "内容") or self._get_value_from_cells(row, "Content")
+        time_str = self._get_value_from_cells(row, "时间") or self._get_value_from_cells(row, "Time")
+        
+        if content_val and time_str:
+            timestamp_pattern = re.compile(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})")
+            content_ts_match = timestamp_pattern.search(content_val)
+            if content_ts_match:
+                content_ts_str = content_ts_match.group(1)
+                try:
+                    row_dt = self._parse_timestamp(time_str)
+                    content_dt = self._parse_timestamp(content_ts_str)
+                    
+                    if row_dt and content_dt:
+                        diff = (row_dt - content_dt).total_seconds() / 60
+                        # Only record if positive delay? Or all? 
+                        # Usually "Delay" implies positive. 
+                        # If diff > 0, it means uploaded later than event time.
+                        if diff > 0:
+                            extracted["延时时长"] = f"{int(diff)}m"
+                except:
+                    pass
+
         return extracted
+
+    def _get_tags(self, row: Dict) -> List[str]:
+        """
+        Get tags for a single row based on rules.
+        """
+        tags = []
+        content_val = self._get_value_from_cells(row, "内容") or self._get_value_from_cells(row, "Content")
+        time_str = self._get_value_from_cells(row, "时间") or self._get_value_from_cells(row, "Time")
+        
+        if not content_val:
+            return tags
+            
+        # A. Non-Critical Tagging
+        is_non_critical = False
+        # Check keywords
+        for kw in self.TAG_CONFIG["non_critical"]["keywords"]:
+            if kw in content_val:
+                is_non_critical = True
+                break
+        # Check regex
+        if not is_non_critical:
+            for rx in self.TAG_CONFIG["non_critical"]["regex"]:
+                if re.search(rx, content_val):
+                    is_non_critical = True
+                    break
+        
+        if is_non_critical:
+            tags.append("【ℹ️非关键】")
+
+        # B. Delayed Upload Tagging
+        timestamp_pattern = re.compile(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})")
+        content_ts_match = timestamp_pattern.search(content_val)
+        if content_ts_match and time_str:
+            content_ts_str = content_ts_match.group(1)
+            try:
+                row_dt = self._parse_timestamp(time_str)
+                content_dt = self._parse_timestamp(content_ts_str)
+                
+                if row_dt and content_dt:
+                    diff = (row_dt - content_dt).total_seconds() / 60
+                    if diff > self.TAG_CONFIG["delayed_upload"]["threshold_minutes"]:
+                        tags.append(f"【⏳延时上传:{int(diff)}分】")
+            except:
+                pass
+
+        # C. Human Operation Tagging
+        is_human = False
+        cells = row.get("cells", {})
+        if isinstance(cells, dict):
+            for cell in cells.values():
+                if isinstance(cell, dict):
+                    style = cell.get("style", {})
+                    if isinstance(style, dict):
+                        if self._is_purple_color(style.get("backgroundColor")):
+                            is_human = True
+                            break
+        if "检修" in content_val or "机修工单" in content_val:
+            is_human = True
+        if is_human:
+            tags.append("【⚠️现场人工操作】")
+
+        # D. Work Order Tagging
+        if "工单" in content_val:
+            tags.append("【🚨高优先级-工单】")
+            
+        return tags
 
     def process(self, rows: List[Dict], return_logs: bool = False) -> Union[str, Dict]:
         """
@@ -455,9 +561,10 @@ async def analyze_events(request: AnalysisRequest):
 def process_d240_faults(rows: List[Dict], headers: List[str]) -> List[Dict]:
     """
     Process '故障代码D240' rows:
-    1. Sort by Inner Time, then Inner MS.
-    2. Merge faults with identical (Device Time, Inner Time, Inner MS).
-    3. Merged format: [InnerTime InnerMS] ['Fault1']['Fault2']...
+    1. Group by Device ID (Contract No.) to ensure isolation.
+    2. Sort by Inner Time, then Inner MS.
+    3. Merge faults with identical (Device Time, Inner Time, Inner MS).
+    4. Merged format: [InnerTime InnerMS] ['Fault1']['Fault2']...
     """
     if not rows:
         return rows
@@ -465,6 +572,8 @@ def process_d240_faults(rows: List[Dict], headers: List[str]) -> List[Dict]:
     content_col = next((h for h in headers if "内容" in h), None)
     time_col = next((h for h in headers if "时间" in h), None)
     type_col = next((h for h in headers if "类型" in h), None)
+    # Identify device/contract column (usually 2nd column)
+    device_col = headers[1] if len(headers) > 1 else None
     
     if not content_col or not time_col:
         return rows
@@ -478,155 +587,117 @@ def process_d240_faults(rows: List[Dict], headers: List[str]) -> List[Dict]:
     # Format: '434(安全回路（#29）断开)'
     fault_code_pattern = re.compile(r"^\s*'([A-Za-z0-9]+)")
     
-    # Group rows by Device Time
-    # Key: str(device_time_value) -> List of row indices
-    device_time_groups = {}
+    # --- Group by Device ID first ---
+    # device_id -> list of indices
+    device_groups = {}
     for i, row in enumerate(rows):
-        t_val = row["cells"].get(time_col, {}).get("value")
-        t_key = str(t_val) if t_val else "UNKNOWN"
-        if t_key not in device_time_groups:
-            device_time_groups[t_key] = []
-        device_time_groups[t_key].append(i)
+        d_val = "UNKNOWN"
+        if device_col:
+            d_val = str(row["cells"].get(device_col, {}).get("value", "UNKNOWN"))
         
+        if d_val not in device_groups:
+            device_groups[d_val] = []
+        device_groups[d_val].append(i)
+    
     # Set of indices to remove (merged into others)
     indices_to_remove = set()
-    
     # Map of index -> new row data (if modified/merged)
     modified_rows = {}
     
-    for t_key, indices in device_time_groups.items():
-        # Identify D240 rows in this group
-        d240_indices = []
-        for idx in indices:
+    # Process each device group independently
+    for d_val, d_indices in device_groups.items():
+        
+        # Sub-group by Device Time within this device
+        # Key: str(device_time_value) -> List of row indices
+        device_time_groups = {}
+        for idx in d_indices:
             row = rows[idx]
-            # Check type or content for "故障代码D240"
-            # User said: "故障代码D240" is likely in type column or content
-            type_val = str(row["cells"].get(type_col, {}).get("value", "")) if type_col else ""
-            content_val = str(row["cells"].get(content_col, {}).get("value", ""))
+            t_val = row["cells"].get(time_col, {}).get("value")
+            t_key = str(t_val) if t_val else "UNKNOWN"
+            if t_key not in device_time_groups:
+                device_time_groups[t_key] = []
+            device_time_groups[t_key].append(idx)
             
-            if "故障代码D240" in type_val or "故障代码D240" in content_val:
-                d240_indices.append(idx)
-        
-        if not d240_indices:
-            continue
-            
-        # Parse D240 rows
-        # List of dicts: {idx, inner_time_str, inner_ms_int, fault_content_str}
-        parsed_d240 = []
-        for idx in d240_indices:
-            content_val = str(rows[idx]["cells"].get(content_col, {}).get("value", ""))
-            match = inner_time_pattern.search(content_val)
-            if match:
-                inner_time = match.group(1)
-                inner_ms = int(match.group(2))
-                # Extract fault content part: everything after ]
-                # e.g. " ['697(...)']"
-                fault_part = content_val[match.end():].strip()
-            else:
-                # Fallback if pattern doesn't match, treat as 0 timestamp?
-                # Or just ignore sorting for this one
-                inner_time = "0000-00-00 00:00:00"
-                inner_ms = 0
-                fault_part = content_val
-            
-            parsed_d240.append({
-                "idx": idx,
-                "inner_time": inner_time,
-                "inner_ms": inner_ms,
-                "fault_part": fault_part
-            })
-            
-        # Group by (inner_time, inner_ms) for merging
-        merge_groups = {}
-        for item in parsed_d240:
-            key = (item["inner_time"], item["inner_ms"])
-            if key not in merge_groups:
-                merge_groups[key] = []
-            merge_groups[key].append(item)
-            
-        # Process each merge group
-        # Result: List of new row objects (merged)
-        final_d240_rows = []
-        
-        # We need to process merge groups in order of time key
-        sorted_keys = sorted(merge_groups.keys(), key=lambda k: (k[0], k[1]))
-        
-        for key in sorted_keys:
-            items = merge_groups[key]
-            
-            # Collect all faults
-            all_faults = []
-            for item in items:
-                # fault_part might be "['Code(...)']" or multiple "['A'] ['B']" ?
-                # User example: "['697(...)']"
-                # We need to extract individual ['...'] blocks or just parse the strings
-                # Let's simple find all matches of \['[^']+?\'\]
-                # or just use the fault_part string if it's simple.
-                # User wants to sort by code.
+        for t_key, indices in device_time_groups.items():
+            # Identify D240 rows in this group
+            d240_indices = []
+            for idx in indices:
+                row = rows[idx]
+                type_val = str(row["cells"].get(type_col, {}).get("value", "")) if type_col else ""
+                content_val = str(row["cells"].get(content_col, {}).get("value", ""))
                 
-                # Regex to find ['...'] blocks
-                # Assuming standard python list repr or user's bracketed format
-                # Example: "['434(...)']"
+                if "故障代码D240" in type_val or "故障代码D240" in content_val:
+                    d240_indices.append(idx)
+            
+            if not d240_indices:
+                continue
                 
-                # Let's find all occurrences of ['...']
-                # Be careful with nested brackets if any, but fault codes usually simple.
-                
-                fault_matches = re.findall(r"(\['[^']+'\])", item["fault_part"])
-                if not fault_matches:
-                    # Maybe it's not bracketed? Just add whole part
-                    all_faults.append((item["fault_part"], "0"))
+            # Parse D240 rows
+            parsed_d240 = []
+            for idx in d240_indices:
+                content_val = str(rows[idx]["cells"].get(content_col, {}).get("value", ""))
+                match = inner_time_pattern.search(content_val)
+                if match:
+                    inner_time = match.group(1)
+                    inner_ms = int(match.group(2))
+                    fault_part = content_val[match.end():].strip()
                 else:
-                    for f_str in fault_matches:
-                        # Extract code for sorting
-                        # f_str is "['434(...)']"
-                        # Clean to "434(...)"
-                        inner_str = f_str[2:-2] # remove [' and ']
-                        # Extract code
-                        code_match = fault_code_pattern.search(inner_str)
-                        code = code_match.group(1) if code_match else inner_str
-                        all_faults.append((f_str, code))
-            
-            # Sort faults by code
-            # Assuming alphanumeric sort
-            all_faults.sort(key=lambda x: x[1])
-            
-            # Construct merged content
-            # Format: [Time MS] ['Fault1']['Fault2']
-            inner_time, inner_ms = key
-            merged_faults_str = "".join([f[0] for f in all_faults])
-            new_content = f"[{inner_time} {inner_ms}ms] {merged_faults_str}"
-            
-            # We use the FIRST index of this group to hold the result
-            # But wait, we are reordering everything within the Device Time group.
-            # So we will just generate a list of row contents to place back into the d240_indices slots.
-            
-            final_d240_rows.append(new_content)
-            
-        # Now we have sorted, merged contents: final_d240_rows
-        # And we have original indices: d240_indices
-        
-        # We place the new contents into the first N indices of d240_indices
-        # And mark the remaining indices for removal
-        
-        for i in range(len(d240_indices)):
-            orig_idx = d240_indices[i]
-            if i < len(final_d240_rows):
-                # Update this row
-                # We need to deep copy the row to avoid mutating original list reference directly until we build result
-                # But here we can just prepare a modification
-                new_content = final_d240_rows[i]
+                    inner_time = "0000-00-00 00:00:00"
+                    inner_ms = 0
+                    fault_part = content_val
                 
-                # Clone row
-                old_row = rows[orig_idx]
-                new_row = old_row.copy()
-                new_row["cells"] = old_row["cells"].copy()
-                new_row["cells"][content_col] = old_row["cells"][content_col].copy()
-                new_row["cells"][content_col]["value"] = new_content
+                parsed_d240.append({
+                    "idx": idx,
+                    "inner_time": inner_time,
+                    "inner_ms": inner_ms,
+                    "fault_part": fault_part
+                })
                 
-                modified_rows[orig_idx] = new_row
-            else:
-                # This slot is no longer needed (merged into previous)
-                indices_to_remove.add(orig_idx)
+            # Group by (inner_time, inner_ms) for merging
+            merge_groups = {}
+            for item in parsed_d240:
+                key = (item["inner_time"], item["inner_ms"])
+                if key not in merge_groups:
+                    merge_groups[key] = []
+                merge_groups[key].append(item)
+                
+            # Process each merge group
+            final_d240_rows = []
+            sorted_keys = sorted(merge_groups.keys(), key=lambda k: (k[0], k[1]))
+            
+            for key in sorted_keys:
+                items = merge_groups[key]
+                all_faults = []
+                for item in items:
+                    fault_matches = re.findall(r"(\['[^']+'\])", item["fault_part"])
+                    if not fault_matches:
+                        all_faults.append((item["fault_part"], "0"))
+                    else:
+                        for f_str in fault_matches:
+                            inner_str = f_str[2:-2]
+                            code_match = fault_code_pattern.search(inner_str)
+                            code = code_match.group(1) if code_match else inner_str
+                            all_faults.append((f_str, code))
+                
+                all_faults.sort(key=lambda x: x[1])
+                inner_time, inner_ms = key
+                merged_faults_str = "".join([f[0] for f in all_faults])
+                new_content = f"[{inner_time} {inner_ms}ms] {merged_faults_str}"
+                final_d240_rows.append(new_content)
+                
+            # Update rows
+            for i in range(len(d240_indices)):
+                orig_idx = d240_indices[i]
+                if i < len(final_d240_rows):
+                    new_content = final_d240_rows[i]
+                    old_row = rows[orig_idx]
+                    new_row = old_row.copy()
+                    new_row["cells"] = old_row["cells"].copy()
+                    new_row["cells"][content_col] = old_row["cells"][content_col].copy()
+                    new_row["cells"][content_col]["value"] = new_content
+                    modified_rows[orig_idx] = new_row
+                else:
+                    indices_to_remove.add(orig_idx)
                 
     # Reconstruct rows list
     new_rows = []
@@ -643,13 +714,15 @@ def process_d240_faults(rows: List[Dict], headers: List[str]) -> List[Dict]:
 def aggregate_traces(rows: List[Dict], headers: List[str]) -> List[Dict]:
     """
     Aggregate Control Trace (53552 center) and Management Trace (53504 center).
+    Ensures aggregation is isolated by Device ID (Contract No.).
     """
     if not rows:
         return rows
 
-    # Find the index of "信息内容" or similar column
     content_col = next((h for h in headers if "内容" in h), None)
     time_col = next((h for h in headers if "时间" in h), None)
+    # Identify device/contract column
+    device_col = headers[1] if len(headers) > 1 else None
     
     if not content_col:
         return rows
@@ -674,117 +747,178 @@ def aggregate_traces(rows: List[Dict], headers: List[str]) -> List[Dict]:
 
     processed_rows = []
     skip_indices = set()
-    
-    # We iterate by index to look ahead/behind
-    # Group rows by timestamp first? 
-    # Actually, scanning neighbors is safer because they might not be strictly sorted by time if milliseconds differ slightly or are missing.
-    # But usually they are adjacent.
-    
-    # Let's group by timestamp first to make it robust
-    # Map: timestamp -> list of (index, row)
-    # But "timestamp" column value might differ slightly? 
-    # The example shows identical "装置时间": 2025-12-08 10:58:17
-    
-    rows_by_time = {}
-    for i, row in enumerate(rows):
-        t_val = row["cells"].get(time_col, {}).get("value")
-        if t_val:
-            # Convert to string to use as key
-            t_key = str(t_val)
-            if t_key not in rows_by_time:
-                rows_by_time[t_key] = []
-            rows_by_time[t_key].append((i, row))
-        else:
-            # No time, treat as unique group? Or just separate.
-            # We'll just append them to processed_rows if they are not skipped
-            pass
-
-    # Target sets
-    control_target = {'53552', '53553', '53554', '53555', '53556', '53557', '53558'}
-    mgmt_target = {'53504', '53505', '53506', '53507', '53508'}
-    
     replacements = {} # Map index -> new content string
-
-    # First pass: Identify clusters and mark rows to skip
+    
+    # --- Group by Device ID first ---
+    # device_id -> list of indices
+    device_groups = {}
     for i, row in enumerate(rows):
-        # We only look for centers here
-        content_cell = row["cells"].get(content_col, {})
-        content_text = content_cell.get("value", "")
-        trace_id = extract_id(content_text)
+        d_val = "UNKNOWN"
+        if device_col:
+            d_val = str(row["cells"].get(device_col, {}).get("value", "UNKNOWN"))
         
-        if trace_id == '53552':
-            # Control Trace Center
-            t_val = row["cells"].get(time_col, {}).get("value")
-            t_key = str(t_val) if t_val else None
-            
-            candidates = rows_by_time.get(t_key, [(i, row)])
-            
-            found_ids = set()
-            cluster_indices = []
-            
-            for c_idx, c_row in candidates:
-                # Don't claim rows already claimed by another cluster?
-                # But here we are just finding members.
-                # If a row is a member of multiple clusters (impossible with current ID sets), we might have issue.
-                # Assuming disjoint sets.
-                
-                c_text = c_row["cells"].get(content_col, {}).get("value", "")
-                c_id = extract_id(c_text)
-                
-                if c_id in control_target:
-                    found_ids.add(c_id)
-                    cluster_indices.append(c_idx)
-            
-            # Generate summary
-            timestamp_str = extract_content_timestamp(content_text)
-            missing = sorted(list(control_target - found_ids))
-            
-            if not missing:
-                summary = f"控制Trace{timestamp_str}（完整）"
-            else:
-                missing_str = "、".join(missing)
-                summary = f"控制Trace{timestamp_str} 缺少{missing_str}数据"
-            
-            replacements[i] = summary
-            
-            # Mark members to skip (excluding the center itself, which we will handle via replacements)
-            for c_idx in cluster_indices:
-                if c_idx != i:
-                    skip_indices.add(c_idx)
+        if d_val not in device_groups:
+            device_groups[d_val] = []
+        device_groups[d_val].append(i)
 
-        elif trace_id == '53504':
-            # Management Trace Center
-            t_val = row["cells"].get(time_col, {}).get("value")
-            t_key = str(t_val) if t_val else None
+    # Helper to parse timestamp
+    def parse_time(t_str):
+        if not t_str: return None
+        # Try common formats
+        for fmt in ["%Y-%m-%d %H:%M:%S", "%Y/%m/%d %H:%M:%S", "%H:%M:%S"]:
+            try:
+                return datetime.strptime(str(t_str), fmt)
+            except ValueError:
+                continue
+        return None
+
+    # Process each device group independently
+    for d_val, d_indices in device_groups.items():
+        
+        # Target sets
+        control_target = {'53552', '53553', '53554', '53555', '53556', '53557', '53558'}
+        mgmt_target = {'53504', '53505', '53506', '53507', '53508'}
+        
+        # Pre-parse timestamps for all rows in this device to optimize lookups
+        # Map: idx -> datetime object
+        row_times = {}
+        for idx in d_indices:
+            t_val = rows[idx]["cells"].get(time_col, {}).get("value")
+            dt = parse_time(t_val)
+            if dt:
+                row_times[idx] = dt
+
+        # Iterate over indices in this device group
+        for i, idx in enumerate(d_indices):
+            row = rows[idx]
+            content_cell = row["cells"].get(content_col, {})
+            content_text = content_cell.get("value", "")
+            trace_id = extract_id(content_text)
             
-            candidates = rows_by_time.get(t_key, [(i, row)])
-            
-            found_ids = set()
-            cluster_indices = []
-            
-            for c_idx, c_row in candidates:
-                c_text = c_row["cells"].get(content_col, {}).get("value", "")
-                c_id = extract_id(c_text)
+            if trace_id == '53552': # Control Trace Center
+                center_dt = row_times.get(idx)
                 
-                if c_id in mgmt_target:
-                    found_ids.add(c_id)
-                    cluster_indices.append(c_idx)
-            
-            # Generate summary
-            timestamp_str = extract_content_timestamp(content_text)
-            missing = sorted(list(mgmt_target - found_ids))
-            
-            if not missing:
-                summary = f"管理Trace{timestamp_str}（完整）"
-            else:
-                missing_str = "、".join(missing)
-                summary = f"管理Trace{timestamp_str} 缺少{missing_str}数据"
-            
-            replacements[i] = summary
-            
-            for c_idx in cluster_indices:
-                if c_idx != i:
-                    skip_indices.add(c_idx)
+                candidates = []
+                if center_dt:
+                    # Time-based window: [-10s, +20s]
+                    # We scan nearby rows. Since rows are roughly sorted, we can optimize, 
+                    # but simple window scan around index is safer if sorting isn't perfect.
+                    # Let's scan a reasonable row window (e.g. +/- 50 rows) and check time.
+                    search_start = max(0, i - 50)
+                    search_end = min(len(d_indices), i + 50)
+                    
+                    for k in range(search_start, search_end):
+                        c_idx = d_indices[k]
+                        c_dt = row_times.get(c_idx)
+                        if c_dt:
+                            # Handle date rollover if formats lack date? 
+                            # Assuming formats have date or consistent relative time.
+                            # If only time is present, date diff might be huge if crossing midnight, but let's assume simple diff.
+                            try:
+                                diff = (c_dt - center_dt).total_seconds()
+                                if -10 <= diff <= 20:
+                                    candidates.append((c_idx, rows[c_idx]))
+                            except:
+                                pass
+                else:
+                    # Fallback to row count if no time
+                    start_window = max(0, i - 20)
+                    end_window = min(len(d_indices), i + 21)
+                    for k in range(start_window, end_window):
+                        c_idx = d_indices[k]
+                        candidates.append((c_idx, rows[c_idx]))
+                
+                found_ids = set()
+                cluster_indices = []
+                for c_idx, c_row in candidates:
+                    # Skip if this row is already claimed by another cluster (check skip_indices?)
+                    # But skip_indices is populated as we go.
+                    # If we look BACK, we might pick up a row that was already processed?
+                    # The center 53552 is unique for a trace event. 
+                    # The parts (53553...) should only belong to one center.
+                    # If we have multiple centers close by, we might have ambiguity.
+                    # But typically traces are sparse.
+                    
+                    c_text = c_row["cells"].get(content_col, {}).get("value", "")
+                    c_id = extract_id(c_text)
+                    if c_id in control_target:
+                        # Ensure we don't pick up another center (53552) as a member?
+                        # control_target includes 53552.
+                        # We are looking for members. 
+                        # If c_id is 53552 and c_idx != idx, it's another center. 
+                        # We should PROBABLY not merge another center into this one unless it's a duplicate?
+                        # But Trace: 53552 IS the center. 
+                        # We just want to find unique IDs.
+                        
+                        # If c_idx is another center (53552) and c_idx != idx, we should ignore it here?
+                        # Actually, if we have two 53552s close by, they are likely distinct events.
+                        # We should probably only aggregate non-center parts, or parts that haven't been claimed.
+                        # For simplicity, let's assume parts are unique in the window.
+                        
+                        found_ids.add(c_id)
+                        cluster_indices.append(c_idx)
+                
+                timestamp_str = extract_content_timestamp(content_text)
+                missing = sorted(list(control_target - found_ids))
+                if not missing:
+                    summary = f"控制Trace{timestamp_str}（完整）"
+                else:
+                    missing_str = "、".join(missing)
+                    summary = f"控制Trace{timestamp_str} 缺少{missing_str}数据"
+                
+                replacements[idx] = summary
+                for c_idx in cluster_indices:
+                    if c_idx != idx:
+                        skip_indices.add(c_idx)
+
+            elif trace_id == '53504': # Management Trace Center
+                center_dt = row_times.get(idx)
+                
+                candidates = []
+                if center_dt:
+                    # Time-based window: [-10s, +20s]
+                    search_start = max(0, i - 50)
+                    search_end = min(len(d_indices), i + 50)
+                    
+                    for k in range(search_start, search_end):
+                        c_idx = d_indices[k]
+                        c_dt = row_times.get(c_idx)
+                        if c_dt:
+                            try:
+                                diff = (c_dt - center_dt).total_seconds()
+                                if -10 <= diff <= 20:
+                                    candidates.append((c_idx, rows[c_idx]))
+                            except:
+                                pass
+                else:
+                    # Fallback
+                    start_window = max(0, i - 20)
+                    end_window = min(len(d_indices), i + 21)
+                    for k in range(start_window, end_window):
+                        c_idx = d_indices[k]
+                        candidates.append((c_idx, rows[c_idx]))
+                
+                found_ids = set()
+                cluster_indices = []
+                for c_idx, c_row in candidates:
+                    c_text = c_row["cells"].get(content_col, {}).get("value", "")
+                    c_id = extract_id(c_text)
+                    if c_id in mgmt_target:
+                        found_ids.add(c_id)
+                        cluster_indices.append(c_idx)
+                
+                timestamp_str = extract_content_timestamp(content_text)
+                missing = sorted(list(mgmt_target - found_ids))
+                if not missing:
+                    summary = f"管理Trace{timestamp_str}（完整）"
+                else:
+                    missing_str = "、".join(missing)
+                    summary = f"管理Trace{timestamp_str} 缺少{missing_str}数据"
+                
+                replacements[idx] = summary
+                for c_idx in cluster_indices:
+                    if c_idx != idx:
+                        skip_indices.add(c_idx)
 
     # Second pass: Build result
     for i, row in enumerate(rows):
@@ -894,10 +1028,11 @@ async def upload_file(file: UploadFile = File(...)):
         # Process D240 faults (sort and merge)
         rows = process_d240_faults(rows, headers)
         
-        # Enrich with global attributes
+        # Enrich with global attributes and tags
         preprocessor = TimelinePreprocessor()
         for row in rows:
             row["global_attributes"] = preprocessor._extract_attributes(row)
+            row["tags"] = preprocessor._get_tags(row)
 
         result = {
             "sheet_name": target_sheet_name,
