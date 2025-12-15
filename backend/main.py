@@ -2,9 +2,22 @@ from fastapi import FastAPI, UploadFile, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import openpyxl
 import io
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Union
+import os
+from openai import OpenAI
+from pydantic import BaseModel
 
 app = FastAPI()
+
+# Initialize OpenAI Client (Ensure OPENAI_API_KEY is set in environment)
+client = OpenAI(
+    api_key=os.environ.get("OPENAI_API_KEY", "sk-placeholder"),
+    base_url=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+)
+
+class AnalysisRequest(BaseModel):
+    rows: List[Dict]
+    context: str = ""
 
 # Enable CORS for frontend
 app.add_middleware(
@@ -28,6 +41,416 @@ def get_rgb_color(color_obj):
     return None
 
 import re
+import json
+from datetime import datetime
+
+class TimelinePreprocessor:
+    """
+    Implements domain-specific logic to clean, filter, and enrich timeline data
+    before sending it to the LLM.
+    """
+    
+    # Configuration for Tagging System
+    TAG_CONFIG = {
+        "non_critical": {
+            "keywords": [
+                "391(管理综合故障)",
+                "7C8(前门门机警告类综合故障)",
+            ],
+            "regex": [
+                # r"故障代码.*\(无关\)" # Example regex
+            ]
+        },
+        "delayed_upload": {
+            "threshold_minutes": 10
+        }
+    }
+
+    # Configuration for Global Attribute Extraction
+    # Format: { AttributeName: [ { keys: [k1, k2], value_map: {val_in_json: normalized_val} } ] }
+    GLOBAL_ATTR_CONFIG = {
+        "控制同步层": [
+            {
+                "keys": ["控制同步层"], # Try these keys in order
+                "value_map": None, # Direct value
+                "transform": lambda x: int(x) + 1 if str(x).isdigit() else x # Transform +1 for floor
+            }
+        ],
+        "41DG信号": [
+            # Case 1: 故障诊断履历
+            {
+                "keys": ["41DG信号"],
+                "value_map": {
+                    "闭合": "闭合",
+                    "断开": "断开"
+                }
+            },
+            # Case 2: 运行模式 / 检修开关履历
+            {
+                "keys": ["门锁状态（41DG）"],
+                "value_map": {
+                    "门锁断开(41DG_OFF)": "断开",
+                    "门锁闭合(41DG_ON)": "闭合", # Assuming opposite exists
+                    "闭合": "闭合"
+                }
+            }
+        ]
+    }
+
+    def __init__(self):
+        self.last_fault_time = 0
+        self.last_fault_code = None
+
+    def _is_purple_color(self, hex_color: str) -> bool:
+        if not hex_color:
+            return False
+        hex_color = hex_color.upper().replace('#', '')
+        if len(hex_color) != 6:
+            return False
+        try:
+            r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+            return r > 100 and b > 100 and g < 100
+        except:
+            return False
+
+    def _extract_json_from_comment(self, comment: str) -> Dict:
+        """
+        Robustly extract JSON-like structure from comment string.
+        Handles: Note: {...} or just {...} or Python dict string representation.
+        """
+        if not comment:
+            return {}
+        
+        # Try to find { ... } block
+        match = re.search(r'(\{.*\})', comment, re.DOTALL)
+        if not match:
+            return {}
+        
+        json_str = match.group(1)
+        try:
+            # Try standard JSON
+            return json.loads(json_str)
+        except:
+            try:
+                # Try replacing single quotes with double quotes (Python dict str)
+                # Handle boolean values
+                fixed_str = json_str.replace("'", '"')\
+                                    .replace("True", "true")\
+                                    .replace("False", "false")\
+                                    .replace("None", "null")
+                return json.loads(fixed_str)
+            except:
+                return {}
+
+    def _get_value_from_cells(self, row: Dict, key_substr: str) -> str:
+        """Helper to find value in cells where column name contains key_substr"""
+        for col_name, cell_data in row.get("cells", {}).items():
+            if key_substr in col_name:
+                return str(cell_data.get("value", ""))
+        return ""
+
+    def _get_comment_from_cells(self, row: Dict) -> str:
+        """Combine comments from all cells"""
+        comments = []
+        for cell_data in row.get("cells", {}).values():
+            c = cell_data.get("comment")
+            if c:
+                comments.append(c)
+        return "\n".join(comments)
+
+    def _parse_timestamp(self, time_str: str) -> datetime:
+        """Parse timestamp string to datetime object."""
+        if not time_str:
+            return None
+        # Try common formats
+        formats = [
+            "%Y-%m-%d %H:%M:%S",
+            "%Y/%m/%d %H:%M:%S",
+            "%H:%M:%S" # If no date, might need context, but for diff check ok?
+        ]
+        for fmt in formats:
+            try:
+                # If only time, assume today or handle gracefully? 
+                # For 10 min diff check, we need full datetime usually.
+                # If input has only time, we might fail comparison if date differs.
+                # Assuming input string has Date if "装置时间" has Date.
+                return datetime.strptime(time_str, fmt)
+            except ValueError:
+                continue
+        return None
+
+    def _extract_attributes(self, row: Dict) -> Dict[str, Any]:
+        """
+        Extract global attributes from a single row.
+        """
+        extracted = {}
+        # Extract Note JSON
+        note_str = self._get_comment_from_cells(row)
+        note_json = self._extract_json_from_comment(note_str)
+        
+        if note_json:
+            for attr_name, rules in self.GLOBAL_ATTR_CONFIG.items():
+                found_val = None
+                
+                for rule in rules:
+                    # Try to find any key from rule['keys'] in note_json
+                    for k in rule['keys']:
+                        if k in note_json:
+                            raw_val = note_json[k]
+                            
+                            # Apply Value Mapping if exists
+                            if rule.get('value_map'):
+                                # Try exact match first
+                                if raw_val in rule['value_map']:
+                                    found_val = rule['value_map'][raw_val]
+                                # Try string match
+                                elif str(raw_val) in rule['value_map']:
+                                    found_val = rule['value_map'][str(raw_val)]
+                                else:
+                                    # Fallback: keep raw if not mapped? Or None?
+                                    # User wants specific mapping. If not mapped, maybe keep raw.
+                                    found_val = raw_val
+                            else:
+                                found_val = raw_val
+                                
+                            # Apply Transformation if exists
+                            if rule.get('transform') and found_val is not None:
+                                try:
+                                    found_val = rule['transform'](found_val)
+                                except:
+                                    pass
+                            
+                            if found_val is not None:
+                                break # Found a valid key for this rule
+                    
+                    if found_val is not None:
+                        break # Found value for this attribute
+                
+                if found_val is not None:
+                    extracted[attr_name] = found_val
+        return extracted
+
+    def process(self, rows: List[Dict], return_logs: bool = False) -> Union[str, Dict]:
+        """
+        Main entry point. 
+        If return_logs is True, returns a dict with 'text' and 'logs'.
+        Otherwise returns just the enriched text string.
+        """
+        enriched_lines = []
+        debug_logs = {
+            "ignored_rows": [],      # List of {id, time, content, reason}
+            "delayed_rows": [],      # List of {id, time, content, delay_min}
+            "attribute_rows": []     # List of {id, time, content, extracted_attrs}
+        }
+        
+        # We need "装置时间" (Device Time) to check for delay.
+        # Assuming "时间" column is the upload time/log time, and there might be an inner "Device Time"?
+        # Or user means: Content has "Time" and Row has "Time".
+        # User said: "只要信息内容中有时间信息，且该时间比装置时间早超过10分钟".
+        # Let's assume Row Time = Device Time (or Upload Time), and Content might contain another timestamp.
+        # Actually usually: Row Time = Log Time (Device Time). 
+        # Wait, if "Upload Time" is later than "Device Time"? 
+        # Let's look for timestamp in Content.
+        
+        timestamp_pattern = re.compile(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})")
+
+        for row in rows:
+            # 1. Get Basic Info
+            row_id = row.get("id")
+            time_str = self._get_value_from_cells(row, "时间") or self._get_value_from_cells(row, "Time")
+            content_val = self._get_value_from_cells(row, "内容") or self._get_value_from_cells(row, "Content")
+            
+            # Skip if empty content
+            if not content_val:
+                continue
+
+            tags = []
+
+            # === 2. Rule-Based Tagging ===
+            
+            # A. Non-Critical Tagging
+            is_non_critical = False
+            # Check keywords
+            for kw in self.TAG_CONFIG["non_critical"]["keywords"]:
+                if kw in content_val:
+                    is_non_critical = True
+                    break
+            # Check regex
+            if not is_non_critical:
+                for rx in self.TAG_CONFIG["non_critical"]["regex"]:
+                    if re.search(rx, content_val):
+                        is_non_critical = True
+                        break
+            
+            if is_non_critical:
+                tags.append("【ℹ️非关键】")
+                if return_logs:
+                    debug_logs["ignored_rows"].append({
+                        "id": row_id,
+                        "time": time_str,
+                        "content": content_val,
+                        "reason": "Matched non-critical keyword/regex"
+                    })
+
+            # B. Delayed Upload Tagging
+            # "信息内容中有时间信息" -> Look for timestamp in content_val
+            content_ts_match = timestamp_pattern.search(content_val)
+            if content_ts_match and time_str:
+                content_ts_str = content_ts_match.group(1)
+                try:
+                    # Row time (Device Time / Log Time)
+                    row_dt = self._parse_timestamp(time_str)
+                    # Content time (Event Time)
+                    content_dt = self._parse_timestamp(content_ts_str)
+                    
+                    if row_dt and content_dt:
+                        # Calculate difference in minutes
+                        diff = (row_dt - content_dt).total_seconds() / 60
+                        if diff > self.TAG_CONFIG["delayed_upload"]["threshold_minutes"]:
+                            tags.append(f"【⏳延时上传:{int(diff)}分】")
+                            if return_logs:
+                                debug_logs["delayed_rows"].append({
+                                    "id": row_id,
+                                    "time": time_str,
+                                    "content": content_val,
+                                    "delay_min": int(diff)
+                                })
+                except:
+                    pass # Date parsing failed, skip check
+
+            # C. Human Operation Tagging (Purple)
+            is_human = False
+            cells = row.get("cells", {})
+            if isinstance(cells, dict):
+                for cell in cells.values():
+                    if isinstance(cell, dict):
+                        style = cell.get("style", {})
+                        if isinstance(style, dict):
+                            if self._is_purple_color(style.get("backgroundColor")):
+                                is_human = True
+                                break
+            if "检修" in content_val or "机修工单" in content_val:
+                is_human = True
+            if is_human:
+                tags.append("【⚠️现场人工操作】")
+
+            # D. Work Order Tagging
+            if "工单" in content_val:
+                tags.append("【🚨高优先级-工单】")
+            
+            # === 3. Global Attribute Extraction ===
+            # Use the helper method
+            extracted_attrs_dict = self._extract_attributes(row)
+            extracted_signals = [f"{k}={v}" for k, v in extracted_attrs_dict.items()]
+
+            if extracted_signals and return_logs:
+                debug_logs["attribute_rows"].append({
+                    "id": row_id,
+                    "time": time_str,
+                    "content": content_val,
+                    "extracted_attrs": extracted_signals
+                })
+
+            # === 4. Construct Final Line ===
+            
+            # Filter out non-critical lines IF we want to hide them from LLM to save tokens
+            # But user said "打标", maybe LLM needs to know it's non-critical but still see it?
+            # Or just hide it. Let's hide it if it's explicitly "Non-Critical" to reduce noise.
+            # However, for "Delayed Upload", we want to show it.
+            
+            if "【ℹ️非关键】" in tags:
+                # We can choose to skip adding this line to context
+                # return or continue
+                continue 
+
+            line = f"[{time_str}]"
+            if tags:
+                line += " " + " ".join(tags)
+            line += f" {content_val}"
+            
+            if extracted_signals:
+                line += "\n   >> 全局属性: " + ", ".join(extracted_signals)
+                
+            enriched_lines.append(line)
+            
+        text_result = "\n".join(enriched_lines)
+        
+        if return_logs:
+            return {"text": text_result, "logs": debug_logs}
+        return text_result
+
+@app.post("/api/debug/preview_rules")
+async def preview_rules(request: AnalysisRequest):
+    """
+    Debug endpoint to preview how rules are applied to the data.
+    Returns detailed logs of ignored rows, delayed uploads, and extracted attributes.
+    """
+    try:
+        preprocessor = TimelinePreprocessor()
+        result = preprocessor.process(request.rows, return_logs=True)
+        return result["logs"]
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/analyze")
+async def analyze_events(request: AnalysisRequest):
+    """
+    Analyze a list of events using LLM with domain knowledge injection.
+    """
+    try:
+        # 1. Preprocess rows using Domain Logic
+        preprocessor = TimelinePreprocessor()
+        data_context = preprocessor.process(request.rows)
+        
+        if not data_context:
+            return {"analysis": "根据预设规则，所选数据中没有发现高价值信息（可能已被过滤）。"}
+
+        # 2. Construct Prompt
+        system_prompt = """
+你是一个电梯工业数据分析专家。请基于提供的时间线事件数据进行解读。
+
+【分析原则】
+1. **高优先级**：工单 > 故障发生(有效) > 故障恢复。这些通常意味着发生了停梯或严重问题。
+2. **人工操作**：标记为【⚠️现场人工操作】的时间段，代表维保人员在现场。在此期间产生的故障可能是调试过程，需结合上下文区分。
+3. **关键信号**：
+   - 关注 '关键信号' 行的数据。
+   - 安全回路(Safety Circuit)断开通常是故障根源。
+   - 门锁回路(Door Lock)断开会导致电梯急停。
+4. **忽略项**：已被标记为【⬇️已降权】或未出现在列表中的警告类信息请忽略。
+
+【输出要求】
+1. **结论先行**：第一句话直接告诉用户发生了什么（例如：“电梯在4楼因安全回路断开导致急停，随后维保人员到场检修”）。
+2. **证据链**：列出支持你结论的关键事件和时间点。
+3. **排版**：使用 Markdown，重点加粗。
+"""
+        
+        user_prompt = f"""
+请分析以下事件数据：
+
+{data_context}
+
+用户补充背景：
+{request.context}
+"""
+
+        # 3. Call LLM
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo", 
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3
+        )
+        
+        return {"analysis": response.choices[0].message.content}
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
 
 def process_d240_faults(rows: List[Dict], headers: List[str]) -> List[Dict]:
     """
@@ -471,6 +894,11 @@ async def upload_file(file: UploadFile = File(...)):
         # Process D240 faults (sort and merge)
         rows = process_d240_faults(rows, headers)
         
+        # Enrich with global attributes
+        preprocessor = TimelinePreprocessor()
+        for row in rows:
+            row["global_attributes"] = preprocessor._extract_attributes(row)
+
         result = {
             "sheet_name": target_sheet_name,
             "headers": headers,
