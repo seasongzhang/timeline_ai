@@ -1037,7 +1037,8 @@ async def upload_file(file: UploadFile = File(...)):
         result = {
             "sheet_name": target_sheet_name,
             "headers": headers,
-            "rows": rows
+            "rows": rows,
+            "server_version": "1.1.0" # Version bump to verify deployment
         }
         
         return clean_for_json(result)

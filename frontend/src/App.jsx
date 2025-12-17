@@ -104,8 +104,12 @@ function App() {
       });
       
       // 更新数据状态
+      console.log('--- Upload Success ---');
+      console.log('Server Version:', response.data.server_version || 'Unknown');
+      console.log('First Row Global Attributes:', response.data.rows?.[0]?.global_attributes);
+      
       setData(response.data);
-      message.success(`成功解析: ${response.data.sheet_name}`);
+      message.success(`成功解析: ${response.data.sheet_name} (v${response.data.server_version || '?'})`);
       
       // 重置筛选器
       setSelectedDevice('All');
