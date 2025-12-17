@@ -1,5 +1,4 @@
 data/
-backend/
 app.py
 analyze_excel.py
 verify_aggregation.py
