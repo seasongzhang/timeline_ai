@@ -3,8 +3,8 @@ import axios from 'axios'; // HTTP 客户端：用于向后端发送请求
 // Ant Design UI 组件库：提供现成的界面元素
 import { Upload, Button, Timeline, Card, Tag, Typography, Input, message, Drawer, Space, Tooltip, Select, Row, Col, Slider, Modal, Spin, Table, Popover, Checkbox } from 'antd';
 // Ant Design 图标库：提供界面所需的各种图标
-import { UploadOutlined, SearchOutlined, FilterOutlined, InfoCircleOutlined, WifiOutlined, ApartmentOutlined, HistoryOutlined, RobotOutlined, BugOutlined, SettingOutlined } from '@ant-design/icons';
-import ReactMarkdown from 'react-markdown';
+import { UploadOutlined, SearchOutlined, FilterOutlined, InfoCircleOutlined, WifiOutlined, ApartmentOutlined, HistoryOutlined, BugOutlined, SettingOutlined } from '@ant-design/icons';
+
 import './index.css'; // 全局样式文件
 
 // ==================== 全局属性配置 ====================
@@ -51,50 +51,14 @@ function App() {
       GLOBAL_ATTR_DEFS.filter(c => c.defaultVisible).map(c => c.key)
   );
 
-  // ==================== AI 分析状态 ====================
-  const [analysisLoading, setAnalysisLoading] = useState(false);
-  const [analysisResult, setAnalysisResult] = useState('');
-  const [isAnalysisModalOpen, setIsAnalysisModalOpen] = useState(false);
+
 
   // ==================== 规则调试状态 ====================
   const [isDebugModalOpen, setIsDebugModalOpen] = useState(false);
   const [debugLogs, setDebugLogs] = useState(null);
   const [debugLoading, setDebugLoading] = useState(false);
 
-  /**
-   * AI 智能解读
-   */
-  const handleAnalyze = async () => {
-    if (filteredRows.length === 0) {
-      message.warning('当前没有数据可分析');
-      return;
-    }
-    
-    // Limit to 50 rows for performance/cost
-    const MAX_ROWS = 50;
-    const rowsToAnalyze = filteredRows.slice(0, MAX_ROWS);
-    
-    if (filteredRows.length > MAX_ROWS) {
-      message.info(`数据量较大，AI 将仅分析前 ${MAX_ROWS} 条记录。`);
-    }
 
-    setAnalysisLoading(true);
-    setIsAnalysisModalOpen(true);
-    setAnalysisResult(''); 
-
-    try {
-      const response = await axios.post('/api/analyze', {
-        rows: rowsToAnalyze,
-        context: "请结合时间线分析事件逻辑。"
-      });
-      setAnalysisResult(response.data.analysis);
-    } catch (error) {
-      console.error(error);
-      setAnalysisResult('分析失败: ' + (error.response?.data?.detail || error.message));
-    } finally {
-      setAnalysisLoading(false);
-    }
-  };
 
   /**
    * 规则引擎调试预览
@@ -618,15 +582,7 @@ function App() {
                     </Button>
                  </Popover>
                  
-                 {/* AI 分析按钮 */}
-                 {/* <Button 
-                    type="default" 
-                    icon={<RobotOutlined style={{ color: '#1890ff' }} />} 
-                    onClick={handleAnalyze}
-                    loading={analysisLoading}
-                 >
-                    AI 解读
-                 </Button> */}
+
 
                  {/* 调试按钮 */}
                  <Tooltip title="查看规则引擎的打标和提取结果">
@@ -879,59 +835,12 @@ function App() {
                   </div>
                ))}
                
-               {/* <div className="mt-4 pt-4 border-t">
-                  <Button block icon={<RobotOutlined />} onClick={() => {
-                      // Analyze single row
-                      setAnalysisLoading(true);
-                      setIsAnalysisModalOpen(true);
-                      setAnalysisResult('');
-                      axios.post('/api/analyze', {
-                          rows: [selectedRow],
-                          context: "请分析此单条事件的含义。"
-                      }).then(res => {
-                          setAnalysisResult(res.data.analysis);
-                      }).catch(err => {
-                          setAnalysisResult('Error: ' + err.message);
-                      }).finally(() => {
-                          setAnalysisLoading(false);
-                      });
-                  }}>
-                      AI Analyze This Event
-                  </Button>
-               </div> */}
+
             </div>
           )}
         </Drawer>
 
-        {/* AI Analysis Result Modal */}
-        <Modal
-        title={
-            <Space>
-                <RobotOutlined style={{ color: '#1890ff' }} />
-                <span>AI 智能解读结果</span>
-            </Space>
-        }
-        open={isAnalysisModalOpen}
-        onCancel={() => setIsAnalysisModalOpen(false)}
-        footer={[
-            <Button key="close" onClick={() => setIsAnalysisModalOpen(false)}>
-                关闭
-            </Button>
-        ]}
-        width={700}
-        styles={{ body: { maxHeight: '60vh', overflowY: 'auto' } }}
-      >
-          {analysisLoading && !analysisResult ? (
-              <div className="flex flex-col items-center justify-center py-10">
-                  <Spin size="large" />
-                  <div className="mt-4 text-gray-500">正在分析数据中，请稍候...</div>
-              </div>
-          ) : (
-              <div className="prose prose-sm max-w-none">
-                  <ReactMarkdown>{analysisResult}</ReactMarkdown>
-              </div>
-          )}
-        </Modal>
+
 
         {/* Debug Rules Modal */}
         <Modal
